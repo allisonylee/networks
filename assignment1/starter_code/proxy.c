@@ -10,8 +10,11 @@
 #include <netinet/in.h>
 #include <errno.h>
 #include <netinet/tcp.h>
+#include <arpa/inet.h>
+#include <signal.h>
 
-#define BACKLOG 10
+#define BACKLOG 10 // queue size
+#define MAXDATASIZE 100 // max number of bytes we can get at once 
 
 void sigchld_handler(int s);
 void *get_in_addr(struct sockaddr *sa);
@@ -107,9 +110,27 @@ int proxy(char *proxy_port) {
 
     if (!fork()) { // this is the child process
       close(sockfd); // child doesn't need the listener
-      printf("child");
-      // accept client request
-      
+
+      // receive info from client
+      int numbytes;
+      char buf[MAXDATASIZE];
+      if ((numbytes = recv(new_fd, buf, MAXDATASIZE-1, 0)) == -1) {
+        perror("recv");
+        exit(1);
+      }
+
+      buf[numbytes] = '\0';
+
+      // parse header of request and get requested URL.
+      struct ParsedRequest *req = ParsedRequest_create();
+
+      if (ParsedRequest_parse(req, buf, numbytes) < 0) {
+        printf("parse failed\n");
+        close(new_fd);
+        exit(1);
+      }
+
+
       close(new_fd);
       exit(0);
     }
