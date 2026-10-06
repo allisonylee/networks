@@ -14,7 +14,7 @@
 #ifndef PROXY_PARSE
 #define PROXY_PARSE
 
-#define DEBUG 1
+#define DEBUG 0
 
 /*
    ParsedRequest objects are created from parsing a buffer containing a HTTP

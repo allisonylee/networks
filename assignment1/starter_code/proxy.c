@@ -14,11 +14,11 @@
 #include <signal.h>
 #include <sys/wait.h>
 
-#define BACKLOG 10 // queue size
+#define BACKLOG 1000 // queue size
 #define MAXDATASIZE 10000 // max number of bytes we can get at once 
 
 void sigchld_handler(int s);
-void *get_in_addr(struct sockaddr *sa);
+int open_listener(char *port, int family);
 int send_all(int fd, const char *buf, size_t len);
 void send_error(int fd, const char *status, struct ParsedRequest *req);
 
@@ -34,56 +34,15 @@ int proxy(char *proxy_port) {
 
   // establish a socket connection
   int sockfd, new_fd;
-  struct addrinfo hints, *servinfo, *p;
   struct sockaddr_storage their_addr;
   socklen_t sin_size;
   struct sigaction sa;
-  int yes = 1;
-  char s[INET6_ADDRSTRLEN];
   int rv;
 
-  memset(&hints, 0, sizeof hints);
-  hints.ai_family = AF_INET;
-  hints.ai_socktype = SOCK_STREAM;
-  hints.ai_flags = AI_PASSIVE;
-
-  if ((rv = getaddrinfo(NULL, proxy_port, &hints, &servinfo)) != 0) {
-    fprintf(stderr, "getaddrinfo: %s\n", gai_strerror(rv));
-    return 1;
-  }
-
-  // loop through all the results and bind to the first we can
-  for(p = servinfo; p != NULL; p = p->ai_next) {
-    if ((sockfd = socket(p->ai_family, p->ai_socktype,
-            p->ai_protocol)) == -1) {
-        perror("server: socket");
-        continue;
-    }
-
-    if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &yes,
-            sizeof(int)) == -1) {
-        perror("setsockopt");
-        exit(1);
-    }
-
-    if (bind(sockfd, p->ai_addr, p->ai_addrlen) == -1) {
-        close(sockfd);
-        perror("server: bind");
-        continue;
-    }
-
-    break;
-  }
-
-  freeaddrinfo(servinfo); // all done with this structure
-
-  if (p == NULL)  {
-    fprintf(stderr, "server: failed to bind\n");
-    exit(1);
-  }
-
-  if (listen(sockfd, BACKLOG) == -1) {
-    perror("listen");
+  // listen on IPv6 and IPv4 so clients reaching "localhost" as ::1 or
+  // 127.0.0.1 both connect; fall back to IPv4 only if IPv6 is unavailable
+  if ((sockfd = open_listener(proxy_port, AF_INET6)) == -1 &&
+      (sockfd = open_listener(proxy_port, AF_INET)) == -1) {
     exit(1);
   }
 
@@ -91,25 +50,19 @@ int proxy(char *proxy_port) {
   sigemptyset(&sa.sa_mask);
   sa.sa_flags = SA_RESTART;
   if (sigaction(SIGCHLD, &sa, NULL) == -1) {
-    perror("sigaction");
     exit(1);
   }
 
-  printf("server: waiting for connections...\n");
+  // a client hanging up mid-response should not kill the process with SIGPIPE
+  signal(SIGPIPE, SIG_IGN);
 
   while(1) {  // main accept() loop for accepting socket connections
     sin_size = sizeof their_addr;
     new_fd = accept(sockfd, (struct sockaddr *)&their_addr,
         &sin_size);
     if (new_fd == -1) {
-        perror("accept");
         continue;
     }
-
-    inet_ntop(their_addr.ss_family,
-        get_in_addr((struct sockaddr *)&their_addr),
-        s, sizeof s);
-    printf("server: got connection from %s\n", s);
 
     if (!fork()) { // this is the child process
       close(sockfd); // child doesn't need the listener
@@ -120,7 +73,7 @@ int proxy(char *proxy_port) {
       while (total < MAXDATASIZE - 1) {
         numbytes = recv(new_fd, buf + total, MAXDATASIZE-1-total, 0);
         if (numbytes == -1) {
-          perror("recv");
+          close(new_fd);
           exit(1);
         } else if (numbytes == 0) break; // client closed connection
         total += numbytes;
@@ -141,7 +94,6 @@ int proxy(char *proxy_port) {
       struct ParsedRequest *req = ParsedRequest_create();
 
       if (ParsedRequest_parse(req, buf, total) < 0) {
-        printf("parse failed\n");
         send_error(new_fd, "400 Bad Request", req);
       }
 
@@ -177,7 +129,6 @@ int proxy(char *proxy_port) {
       hints.ai_socktype = SOCK_STREAM;
 
       if ((rv = getaddrinfo(host, port, &hints, &res)) != 0) {
-        fprintf(stderr, "getaddrinfo: %s\n", gai_strerror(rv));
         free(out);
         send_error(new_fd, "500 Internal Server Error", req);
       }
@@ -192,23 +143,24 @@ int proxy(char *proxy_port) {
         break;
       }
       freeaddrinfo(res);
-      if (p == NULL) { 
-        fprintf(stderr, "could not connect to %s:%s\n", host, port);
+      if (p == NULL) {
         free(out);
         send_error(new_fd, "500 Internal Server Error", req);
       }
 
-      //send all bytes in teh request
-      send_all(remote_fd, out, outlen);
+      //send all bytes in the request
+      if (send_all(remote_fd, out, outlen) == -1) {
+        close(remote_fd);
+        free(out);
+        send_error(new_fd, "500 Internal Server Error", req);
+      }
 
+      // relay the response as-is; once bytes have gone to the client an
+      // error status can't be added, so just stop on failure
       char rbuf[MAXDATASIZE];
       ssize_t k;
       while ((k = recv(remote_fd, rbuf, sizeof rbuf, 0)) > 0) {
-        if (send_all(new_fd, rbuf, k) == -1) {
-          close(remote_fd);
-          free(out);
-          send_error(new_fd, "500 Internal Server Error", req);
-        }
+        if (send_all(new_fd, rbuf, k) == -1) break;
       }
 
       close(remote_fd);
@@ -250,14 +202,48 @@ void sigchld_handler(int s)
 }
 
 
-// get sockaddr, IPv4 or IPv6:
-void *get_in_addr(struct sockaddr *sa)
+// bind and listen on the wildcard address of the given family;
+// returns the listening socket, or -1 on failure
+int open_listener(char *port, int family)
 {
-    if (sa->sa_family == AF_INET) {
-        return &(((struct sockaddr_in*)sa)->sin_addr);
+    struct addrinfo hints, *servinfo, *p;
+    int sockfd = -1;
+    int yes = 1, no = 0;
+
+    memset(&hints, 0, sizeof hints);
+    hints.ai_family = family;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_flags = AI_PASSIVE;
+
+    if (getaddrinfo(NULL, port, &hints, &servinfo) != 0) {
+        return -1;
     }
 
-    return &(((struct sockaddr_in6*)sa)->sin6_addr);
+    // loop through all the results and bind to the first we can
+    for (p = servinfo; p != NULL; p = p->ai_next) {
+        if ((sockfd = socket(p->ai_family, p->ai_socktype,
+                p->ai_protocol)) == -1) {
+            continue;
+        }
+
+        setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof yes);
+        if (family == AF_INET6) {
+            // also accept IPv4 connections on this socket
+            setsockopt(sockfd, IPPROTO_IPV6, IPV6_V6ONLY, &no, sizeof no);
+        }
+
+        if (bind(sockfd, p->ai_addr, p->ai_addrlen) == -1 ||
+            listen(sockfd, BACKLOG) == -1) {
+            close(sockfd);
+            sockfd = -1;
+            continue;
+        }
+
+        break;
+    }
+
+    freeaddrinfo(servinfo); // all done with this structure
+    return sockfd;
 }
 
 
