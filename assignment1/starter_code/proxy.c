@@ -12,12 +12,15 @@
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <signal.h>
+#include <sys/wait.h>
 
 #define BACKLOG 10 // queue size
-#define MAXDATASIZE 100 // max number of bytes we can get at once 
+#define MAXDATASIZE 10000 // max number of bytes we can get at once 
 
 void sigchld_handler(int s);
 void *get_in_addr(struct sockaddr *sa);
+int send_all(int fd, const char *buf, size_t len);
+void send_error(int fd, const char *status, struct ParsedRequest *req);
 
 /* TODO: proxy()
  * Establish a socket connection to listen for incoming connections.
@@ -112,26 +115,106 @@ int proxy(char *proxy_port) {
       close(sockfd); // child doesn't need the listener
 
       // receive info from client
-      int numbytes;
+      int numbytes, total = 0;
       char buf[MAXDATASIZE];
-      if ((numbytes = recv(new_fd, buf, MAXDATASIZE-1, 0)) == -1) {
-        perror("recv");
-        exit(1);
+      while (total < MAXDATASIZE - 1) {
+        numbytes = recv(new_fd, buf + total, MAXDATASIZE-1-total, 0);
+        if (numbytes == -1) {
+          perror("recv");
+          exit(1);
+        } else if (numbytes == 0) break; // client closed connection
+        total += numbytes;
+        buf[total] = '\0';
+        if (strstr(buf, "\r\n\r\n")) break; // we got the full header
       }
 
-      buf[numbytes] = '\0';
+      if (total == 0) {
+        close(new_fd);
+        exit(0);
+      }
+
+      if (!strstr(buf, "\r\n\r\n")) {
+        send_error(new_fd, "400 Bad Request", NULL);
+      }
 
       // parse header of request and get requested URL.
       struct ParsedRequest *req = ParsedRequest_create();
 
-      if (ParsedRequest_parse(req, buf, numbytes) < 0) {
+      if (ParsedRequest_parse(req, buf, total) < 0) {
         printf("parse failed\n");
-        close(new_fd);
-        exit(1);
+        send_error(new_fd, "400 Bad Request", req);
       }
 
+      if (strcmp(req->method, "GET") != 0) {
+        send_error(new_fd, "501 Not Implemented", req);
+      }
 
+      char *host = req->host;
+      char *port = req->port ? req->port : "80";   // default HTTP port
+      char *path = req->path; 
+
+      // change headers
+      ParsedHeader_set(req, "Host", req->host);
+      ParsedHeader_set(req, "Connection", "close");
+
+      // now get data from remote server
+      size_t headerLen = ParsedHeader_headersLen(req);
+      size_t requestLen = strlen(req->method) + strlen(path) + 32 + headerLen;
+      char * out = malloc(requestLen);
+
+      int n = snprintf(out, requestLen, "%s %s HTTP/1.0\r\n", req->method, path);
+      if (ParsedRequest_unparse_headers(req, out + n, requestLen - n) < 0) { 
+        free(out);
+        send_error(new_fd, "500 Internal Server Error", req); 
+      }
+      size_t outlen = n + headerLen;
+
+      struct addrinfo hints, *res, *p;
+      int remote_fd;
+
+      memset(&hints, 0, sizeof hints);
+      hints.ai_family = AF_UNSPEC;  
+      hints.ai_socktype = SOCK_STREAM;
+
+      if ((rv = getaddrinfo(host, port, &hints, &res)) != 0) {
+        fprintf(stderr, "getaddrinfo: %s\n", gai_strerror(rv));
+        free(out);
+        send_error(new_fd, "500 Internal Server Error", req);
+      }
+
+      for (p = res; p != NULL; p = p->ai_next) {
+        if ((remote_fd = socket(p->ai_family, p->ai_socktype, p->ai_protocol)) == -1)
+          continue;
+        if (connect(remote_fd, p->ai_addr, p->ai_addrlen) == -1) {
+          close(remote_fd);
+          continue;
+        }
+        break;
+      }
+      freeaddrinfo(res);
+      if (p == NULL) { 
+        fprintf(stderr, "could not connect to %s:%s\n", host, port);
+        free(out);
+        send_error(new_fd, "500 Internal Server Error", req);
+      }
+
+      //send all bytes in teh request
+      send_all(remote_fd, out, outlen);
+
+      char rbuf[MAXDATASIZE];
+      ssize_t k;
+      while ((k = recv(remote_fd, rbuf, sizeof rbuf, 0)) > 0) {
+        if (send_all(new_fd, rbuf, k) == -1) {
+          close(remote_fd);
+          free(out);
+          send_error(new_fd, "500 Internal Server Error", req);
+        }
+      }
+
+      close(remote_fd);
       close(new_fd);
+      free(out);
+      ParsedRequest_destroy(req);
       exit(0);
     }
     close(new_fd);  // parent doesn't need this
@@ -175,4 +258,25 @@ void *get_in_addr(struct sockaddr *sa)
     }
 
     return &(((struct sockaddr_in6*)sa)->sin6_addr);
+}
+
+
+int send_all(int fd, const char *buf, size_t len) {
+  size_t sent = 0;
+  while (sent < len) {
+    ssize_t k = send(fd, buf + sent, len - sent, 0);
+    if (k == -1) return -1;
+    sent += k;
+  }
+  return 0;
+}
+
+// send an HTTP error status line to the client, clean up, and end the child
+void send_error(int fd, const char *status, struct ParsedRequest *req) {
+  char msg[64];
+  int len = snprintf(msg, sizeof msg, "HTTP/1.0 %s\r\n\r\n", status);
+  send_all(fd, msg, len);
+  if (req) ParsedRequest_destroy(req);
+  close(fd);
+  exit(1);
 }
